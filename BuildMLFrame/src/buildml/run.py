@@ -1,30 +1,44 @@
+import os
 import pandas as pd
 import numpy as np
-from checker import FileCheck
+from utils import FileCheck
 from logger import logger
 from sklearn.preprocessing import LabelEncoder, LabelBinarizer
 from sklearn.model_selection import StratifiedKFold, KFold
 from sklearn.impute import SimpleImputer
+from sklearn.feature_selection import VarianceThreshold
 
 class RunML():
-    def __init__(self, path, label, testpath=None, task="classification"):
+    def __init__(self, path, label, output, testpath=None, task="classification", fillup="mean", seed=42, fold=5):
         self.path = path
         self.testpath = testpath
         self.label = label
+        self.output = output
         self.task = task
+        self.fillup = fillup
+        self.seed = seed
+        self.fold = fold
         self.le = LabelEncoder()
         self.lb = LabelBinarizer()
+
+    def __post_init__(self):
+        if os.path.exists(self.output):
+            raise Exception("Output directory already exists. Please specify some other directory.")
+        os.makedirs(self.output, exist_ok=True)
+        logger.info(f"Output directory: {self.output}")
 
     def _build(self):
 
         #1. read file using pandas
         data = FileCheck()
         train_data = data.check(self.path)
-        # train_data = data.reduce_mem_usage(train_data)
+        train_data = data.reduce_memory_usage(train_data)
         if self.testpath is not None:
             test_data = pd.read_csv(self.testpath)
+            test_data = data.reduce_memory_usage(test_data)
         label = train_data[self.label]
         total_label = label.nunique() # count total label
+
         #2. check null columns if label is missing delete that row
         # get all name in list
         cols = train_data.columns.tolist()
@@ -52,39 +66,77 @@ class RunML():
                     elif categorical_data == 2:
                         train_data[col] = self.lb.fit_transform(train_data[col])
 
+                if missing_val > 0 and train_data[col].dtype != "object" or train_data[col].dtype == "bool" and col != self.label:
+                    logger.info(f"Missing value of column name >> {col}: {missing_val}")
+                    imputer = SimpleImputer(strategy=self.fillup, missing_values=np.nan)
+                    imputer = imputer.fit(train_data[[col]])
+                    train_data[col] = imputer.transform(train_data[[col]])
+        
+
         #3. check is it classification or regression
         if self.task == "classification":
             #4. check label if classification problem. if object type convert to Label type. save file
             if label.dtype == "object" or label.dtype == "bool" and total_label > 2:
                 logger.info(f"Label: {self.label} type object >> Converting in neumerical class")
-                
                 train_data[self.label] = self.le.fit_transform(train_data[self.label])
 
             elif label.dtype == "object" or label.dtype == "bool" and total_label == 2:
                 logger.info(f"Label: {self.label} type object >> Converting in binary class")
-                
                 train_data[self.label] = self.lb.fit_transform(train_data[self.label])
 
-            # create kfold
+            #4. check feature importance
+            # Basic Feature remove: Constant feature. Ref: https://www.kaggle.com/code/raviprakash438/filter-method-feature-selection
+            clf_label = train_data[self.label]
+            train_data.drop(labels=[self.label], axis=1, inplace=True)
+            
+            varModel=VarianceThreshold(threshold=0) #Setting variance threshold to 0 which means features that have same value in all samples.
+            varModel.fit(train_data)
+            constArr=varModel.get_support()
+            constCol=[col for col in train_data.columns if col not in train_data.columns[constArr]]
+            logger.info(f"Constant columns name list: {constCol}" if len(constCol) > 0 else f"No constant columns.")
+            train_data.drop(labels=constCol, axis=1, inplace=True)
+            logger.info(f"Dropped constant colums" if len(constCol) > 0 else f"-------")
+
+            #Create variance threshold model
+            quasiModel=VarianceThreshold(threshold=0.01) #It will search for the features having 99% of same value in all samples.
+            quasiModel.fit(train_data)
+            quasiArr=quasiModel.get_support()
+            quasiCols=[col for col in train_data.columns if col not in train_data.columns[quasiArr]]
+            logger.info(f"Majority with same value columns name list: {quasiCols}" if len(quasiCols) > 0 else f"No major constant columns.")
+            train_data.drop(columns=quasiCols, axis=1, inplace=True)
+            logger.info(f"Dropped major constant colums" if len(quasiCols) > 0 else f"-------")
+            print(train_data)
+
+            #5. create kfold
+            train_data[self.label] = clf_label
             train_data["kfold"] = -1
             train_data = train_data.sample(frac=1).reset_index(drop=True)
             kfold = StratifiedKFold(
-                n_splits=train_data[self.label].nunique(),
+                n_splits=self.fold,
                 shuffle=True, 
-                random_state=42
+                random_state=self.seed
             )
             for fold, (train_idx, val_idx) in enumerate(kfold.split(X=train_data, y=train_data[f"{self.label}"].values)):
                 train_data.loc[val_idx, "kfold"] = fold
-        print(train_data)
         
+        # fold and save fold
+        for fold in range(self.fold):
+            train_fold = train_data[train_data.kfold != fold].reset_index(drop=True)
+            valid_fold = train_data[train_data.kfold == fold].reset_index(drop=True)
+
+            train_fold.to_feather(os.path.join(self.output, f"train_fold_{fold}.feather"))
+            valid_fold.to_feather(os.path.join(self.output, f"valid_fold_{fold}.feather"))
         
-        #5. check feature importance
-        #6. make folds
+
+        
+
         #7. use hypertune optuna
         #8. Track using ml foundry
 
 RunML(
     path="/home/aditta/Desktop/BuildMLModel/BuildMLFrame/src/test/cars.csv",
     label="is_exchangeable",
-    task="classification"
+    output="/home/aditta/Desktop/BuildMLModel/BuildMLFrame/src/test/",
+    task="classification",
+    fillup="mean"
 )._build()
